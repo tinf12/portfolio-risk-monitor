@@ -1,32 +1,102 @@
-"""Idempotent writes.
+"""Writes.
 
-Every write here is an upsert keyed on the table's primary key. Re-running a
-day overwrites that day rather than duplicating it, which is what makes the
-daily job safe to retry and the database safe to commit (CLAUDE.md,
-"Committing data/risk.db").
+Re-running a day never duplicates rows. Two different policies apply, and the
+difference is deliberate:
+
+- `prices` is **write-once**. A stored close is never silently changed. See
+  `insert_prices`.
+- `positions` and `portfolio_pnl` are upserts. They are snapshots of live
+  account state, so re-running a session should refresh them.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+PriceRow = tuple[str, str, float]
 
-def upsert_prices(
+# Vendor closes are floats round-tripped through SQLite. Treat a difference
+# below this as representation noise rather than a genuine restatement.
+RESTATEMENT_TOLERANCE = 1e-9
+
+
+@dataclass
+class PriceWriteResult:
+    """Outcome of a price write."""
+
+    inserted: int = 0
+    unchanged: int = 0
+    restatements: list[tuple[str, str, float, float]] = field(default_factory=list)
+    applied_restatements: int = 0
+
+    @property
+    def has_restatements(self) -> bool:
+        return bool(self.restatements)
+
+
+def insert_prices(
     conn: sqlite3.Connection,
-    rows: Sequence[tuple[str, str, float]],
-) -> int:
-    """Insert or replace (trade_date, symbol, close) rows. Returns row count."""
-    conn.executemany(
-        """
-        INSERT INTO prices (trade_date, symbol, close)
-        VALUES (?, ?, ?)
-        ON CONFLICT (trade_date, symbol) DO UPDATE SET close = excluded.close
-        """,
-        rows,
-    )
-    return len(rows)
+    rows: Sequence[PriceRow],
+    *,
+    allow_restate: bool = False,
+) -> PriceWriteResult:
+    """Insert (trade_date, symbol, close) rows without changing stored closes.
+
+    `prices` is write-once because Alpaca returns split- and dividend-adjusted
+    closes, and the adjustment factor for any past date shrinks with every
+    subsequent distribution. Re-fetching therefore restates the entire history:
+    verified on XLE, where 2020-02-19 carries a factor of 0.3829 against a
+    factor of exactly 1.0 today.
+
+    Overwriting would mean a risk figure computed last month no longer
+    reproduces from stored inputs, which breaks the determinism constraint. The
+    stored close is the input of record. Adjusted prices remain the right
+    choice — they measure total return — so the fix is to freeze them, not to
+    switch to raw.
+
+    Rows whose close differs from what is stored are reported in
+    `restatements` as (trade_date, symbol, stored, incoming) and are **not**
+    applied unless `allow_restate=True`. Reporting rather than ignoring is the
+    point: silent divergence between the database and the vendor is exactly
+    what an auditable system should surface.
+
+    The consequence to accept, and to state in the README: stored history
+    slowly diverges from what the vendor currently reports. A reproducible
+    number is worth more here than an up-to-date one.
+    """
+    result = PriceWriteResult()
+
+    for trade_date, symbol, close in rows:
+        existing = conn.execute(
+            "SELECT close FROM prices WHERE trade_date = ? AND symbol = ?",
+            (trade_date, symbol),
+        ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO prices (trade_date, symbol, close) VALUES (?, ?, ?)",
+                (trade_date, symbol, close),
+            )
+            result.inserted += 1
+            continue
+
+        stored = float(existing["close"])
+        if abs(stored - close) <= RESTATEMENT_TOLERANCE:
+            result.unchanged += 1
+            continue
+
+        result.restatements.append((trade_date, symbol, stored, close))
+        if allow_restate:
+            conn.execute(
+                "UPDATE prices SET close = ? WHERE trade_date = ? AND symbol = ?",
+                (close, trade_date, symbol),
+            )
+            result.applied_restatements += 1
+
+    return result
 
 
 def upsert_positions(

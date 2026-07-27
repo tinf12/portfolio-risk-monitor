@@ -261,6 +261,47 @@ those rows can never breach, which biases the Kupiec test toward acceptance.
 
 ---
 
+## Price restatement
+
+Alpaca returns split- and dividend-adjusted closes. Adjusted is the correct
+input for a total-return series and is what this project uses. But the
+adjustment factor for any past date **shrinks with every subsequent
+distribution**, so re-fetching restates the entire stored history.
+
+Measured on XLE, July 2026:
+
+| Date | Raw | Adjusted | Factor |
+|---|---|---|---|
+| 2020-02-19 | 54.85 | 21.00 | 0.3829 |
+| 2020-03-23 | 23.48 | 9.19 | 0.3914 |
+| 2026-07-24 | 59.62 | 59.62 | 1.0000 |
+
+Left alone, this breaks determinism: a VaR computed last month would not
+reproduce once its input closes had been silently rewritten, and the committed
+database would show a whole-file diff with no code change to explain it.
+
+Therefore:
+
+- **`prices` is write-once.** A stored close is never changed. `insert_prices`
+  inserts missing rows only.
+- Rows whose incoming close differs from the stored one are **reported, not
+  applied**. Silent divergence from the vendor is the thing being prevented, so
+  the drift must be visible.
+- `src.data.backfill --allow-restate` overwrites deliberately. It invalidates
+  reproducibility for every figure already computed from the affected dates, so
+  it is a decision, not a routine step.
+- The daily job treats any restatement as a **failure**. The session it just
+  fetched is new, so a conflicting close means something is wrong upstream, not
+  that history moved on.
+- `positions` and `portfolio_pnl` remain upserts. They are snapshots of live
+  account state, and re-running a session should refresh them.
+
+The accepted consequence, which belongs in the README's limitations: stored
+history slowly diverges from what the vendor currently reports. For a risk
+system a reproducible number is worth more than an up-to-date one.
+
+---
+
 ## P&L definition
 
 `daily_pnl` and the return series used to estimate VaR must be the same series.
@@ -386,8 +427,8 @@ versions of it. The rules:
 - **CI is the only writer that commits.** The scheduled job pulls with rebase,
   writes, and commits. Local runs must either use a scratch copy or not commit
   the result.
-- All writes are idempotent upserts keyed on the primary keys above, so
-  re-running a day overwrites rather than duplicating.
+- Re-running a day never duplicates rows. Two write policies apply, and the
+  split is deliberate — see "Price restatement" below.
 - If a conflict happens anyway, resolve by taking the CI version and re-running
   the backfill locally. Never hand-merge the binary.
 - Backfills are run deliberately and committed as their own commit, separate

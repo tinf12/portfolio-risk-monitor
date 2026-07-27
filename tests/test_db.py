@@ -8,11 +8,11 @@ import pytest
 
 from src.db.upserts import (
     get_previous_total_value,
+    insert_prices,
     latest_successful_run,
     record_run,
     upsert_portfolio_pnl,
     upsert_positions,
-    upsert_prices,
 )
 
 
@@ -37,7 +37,7 @@ class TestSchema:
     def test_create_schema_is_idempotent(self, conn: sqlite3.Connection) -> None:
         from src.db.schema import create_schema
 
-        upsert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        insert_prices(conn,[("2024-01-02", "XLK", 100.0)])
         create_schema(conn)
         assert conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 1
 
@@ -64,15 +64,83 @@ class TestSchema:
         assert count == 2
 
 
-class TestUpsertIdempotency:
-    def test_prices_overwrite_not_duplicate(self, conn: sqlite3.Connection) -> None:
-        upsert_prices(conn, [("2024-01-02", "XLK", 100.0)])
-        upsert_prices(conn, [("2024-01-02", "XLK", 101.5)])
+class TestPricesAreWriteOnce:
+    """Adjusted closes are restated by every later distribution. Overwriting
+    would silently rewrite the inputs of already-computed risk figures, so a
+    stored close is frozen (CLAUDE.md, "Price restatement")."""
+
+    def test_stored_close_is_never_changed(self, conn: sqlite3.Connection) -> None:
+        insert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        result = insert_prices(conn, [("2024-01-02", "XLK", 96.0)])
 
         rows = conn.execute("SELECT * FROM prices").fetchall()
         assert len(rows) == 1
-        assert rows[0]["close"] == 101.5
+        assert rows[0]["close"] == 100.0
+        assert result.inserted == 0
+        assert result.applied_restatements == 0
 
+    def test_restatement_is_reported_not_swallowed(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        insert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        result = insert_prices(conn, [("2024-01-02", "XLK", 96.0)])
+
+        assert result.has_restatements
+        assert result.restatements == [("2024-01-02", "XLK", 100.0, 96.0)]
+
+    def test_identical_reinsert_is_unchanged_not_restated(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """A plain re-run must be quiet; only genuine drift is reported."""
+        rows = [("2024-01-02", "XLK", 100.0)]
+        insert_prices(conn, rows)
+        result = insert_prices(conn, rows)
+
+        assert result.unchanged == 1
+        assert not result.has_restatements
+
+    def test_float_noise_is_not_a_restatement(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        insert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        result = insert_prices(conn, [("2024-01-02", "XLK", 100.0 + 1e-12)])
+
+        assert result.unchanged == 1
+        assert not result.has_restatements
+
+    def test_allow_restate_applies_the_change(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        insert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        result = insert_prices(
+            conn, [("2024-01-02", "XLK", 96.0)], allow_restate=True
+        )
+
+        assert result.applied_restatements == 1
+        stored = conn.execute("SELECT close FROM prices").fetchone()["close"]
+        assert stored == 96.0
+
+    def test_gaps_are_filled_while_existing_rows_are_frozen(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """The re-run case that matters: backfilling a missing day must not
+        disturb the days already stored."""
+        insert_prices(conn, [("2024-01-02", "XLK", 100.0)])
+        result = insert_prices(
+            conn,
+            [("2024-01-02", "XLK", 96.0), ("2024-01-03", "XLK", 101.0)],
+        )
+
+        assert result.inserted == 1
+        assert len(result.restatements) == 1
+        closes = {
+            r["trade_date"]: r["close"]
+            for r in conn.execute("SELECT trade_date, close FROM prices")
+        }
+        assert closes == {"2024-01-02": 100.0, "2024-01-03": 101.0}
+
+
+class TestUpsertIdempotency:
     def test_positions_overwrite_not_duplicate(
         self, conn: sqlite3.Connection
     ) -> None:
@@ -98,10 +166,10 @@ class TestUpsertIdempotency:
     ) -> None:
         """Re-running a session must be safe; the DB is committed to git."""
         rows = [("2024-01-02", sym, 100.0) for sym in ("XLK", "XLF", "XLV")]
-        upsert_prices(conn, rows)
+        insert_prices(conn,rows)
         before = conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
         for _ in range(3):
-            upsert_prices(conn, rows)
+            insert_prices(conn,rows)
         assert conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == before
 
 

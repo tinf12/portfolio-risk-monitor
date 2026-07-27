@@ -30,10 +30,10 @@ from src.data.calendar import (
 from src.db.connection import get_connection
 from src.db.upserts import (
     get_previous_total_value,
+    insert_prices,
     record_run,
     upsert_portfolio_pnl,
     upsert_positions,
-    upsert_prices,
 )
 from src.portfolio.orders import submit_orders
 from src.portfolio.positions import fetch_account_snapshot
@@ -65,7 +65,19 @@ def run_daily(
                     f"Missing closes for {sorted(gaps)} on {session}. "
                     "Refusing to store an incomplete session."
                 )
-            upsert_prices(conn, price_rows)
+            written = insert_prices(conn, price_rows)
+            if written.has_restatements:
+                # The vendor changed a close this job already stored. That is
+                # never expected for the session just fetched, so treat it as a
+                # data integrity failure rather than writing on top of it.
+                sample = ", ".join(
+                    f"{d} {s} {old:.4f}->{new:.4f}"
+                    for d, s, old, new in written.restatements[:5]
+                )
+                raise RuntimeError(
+                    f"{len(written.restatements)} restatement(s) on {session}: "
+                    f"{sample}. Stored values kept; investigate before rerunning."
+                )
 
             snapshot = fetch_account_snapshot()
             upsert_positions(conn, snapshot.position_rows(session))
