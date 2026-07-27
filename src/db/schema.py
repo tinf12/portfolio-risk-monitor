@@ -90,11 +90,43 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+EXPECTED_TABLES: frozenset[str] = frozenset(
+    {
+        "prices",
+        "positions",
+        "portfolio_pnl",
+        "risk_estimates",
+        "portfolio_metrics",
+        "risk_contributions",
+        "runs",
+    }
+)
+
+
+def schema_exists(conn: sqlite3.Connection) -> bool:
+    """True if every expected table is already present."""
+    present = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    return EXPECTED_TABLES <= present
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
     """Create every table and index if it does not already exist.
 
+    Returns without writing when the schema is already complete. This is not a
+    micro-optimisation: SQLite bumps the file change counter on any committed
+    transaction, so an unconditional DDL-plus-commit rewrites bytes in a
+    database that is committed to git. That would produce a binary diff on
+    every scheduled run even when no data changed, burying real changes in
+    noise and defeating the workflow's "nothing to commit" check.
+
     Safe to call on every run. Does not migrate or alter existing tables.
     """
+    if schema_exists(conn):
+        return
+
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
     conn.commit()

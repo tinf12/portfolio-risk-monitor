@@ -43,8 +43,16 @@ def get_connection(
     try:
         if ensure_schema:
             create_schema(conn)
+
+        changes_before = conn.total_changes
         yield conn
-        conn.commit()
+
+        # Commit only when rows actually changed. An empty commit still bumps
+        # SQLite's file change counter, which rewrites bytes in a database that
+        # is committed to git and would show up as a daily binary diff with no
+        # data behind it.
+        if conn.total_changes != changes_before:
+            conn.commit()
     except Exception:
         conn.rollback()
         raise
