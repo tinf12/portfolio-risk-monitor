@@ -52,9 +52,32 @@ def run_daily(
 
     `trade_date` is injectable for replaying a specific session; it defaults to
     the most recent completed one.
+
+    Two safeguards on what may be written:
+
+    - `dry_run` performs every read and computation but commits nothing. A
+      verification run must not leave rows behind.
+    - Account state is a *live* read with no historical equivalent. When
+      `trade_date` is not the most recent completed session, the snapshot
+      describes today, not that date, so positions and P&L are not stored for
+      it. Writing them would fabricate history — a $100k equity recorded
+      against a date the account did not hold it. Prices are unaffected:
+      a historical close is a fact about that date.
     """
     session = trade_date or most_recent_completed_session()
-    logger.info("Daily run for session %s", session)
+    current_session = most_recent_completed_session()
+    is_current = session == current_session
+
+    logger.info("Daily run for session %s%s", session, " (dry run)" if dry_run else "")
+    if not is_current:
+        logger.warning(
+            "Session %s is not the most recent completed session (%s). The "
+            "account snapshot is a live read, so positions and P&L will NOT "
+            "be stored for %s.",
+            session,
+            current_session,
+            session,
+        )
 
     with get_connection() as conn:
         try:
@@ -80,24 +103,31 @@ def run_daily(
                 )
 
             snapshot = fetch_account_snapshot()
-            upsert_positions(conn, snapshot.position_rows(session))
 
-            previous_value = get_previous_total_value(conn, session)
-            if previous_value is not None and previous_value > 0:
-                daily_pnl = snapshot.total_value - previous_value
-                daily_return = daily_pnl / previous_value
+            if is_current:
+                upsert_positions(conn, snapshot.position_rows(session))
+
+                previous_value = get_previous_total_value(conn, session)
+                if previous_value is not None and previous_value > 0:
+                    daily_pnl = snapshot.total_value - previous_value
+                    daily_return = daily_pnl / previous_value
+                else:
+                    daily_pnl = None
+                    daily_return = None
+
+                upsert_portfolio_pnl(
+                    conn,
+                    trade_date=session,
+                    total_value=snapshot.total_value,
+                    cash=snapshot.cash,
+                    daily_pnl=daily_pnl,
+                    daily_return=daily_return,
+                )
             else:
-                daily_pnl = None
-                daily_return = None
-
-            upsert_portfolio_pnl(
-                conn,
-                trade_date=session,
-                total_value=snapshot.total_value,
-                cash=snapshot.cash,
-                daily_pnl=daily_pnl,
-                daily_return=daily_return,
-            )
+                logger.warning(
+                    "Skipped positions and P&L for %s; account state is live.",
+                    session,
+                )
 
             if is_first_trading_day_of_month(session) and not skip_orders:
                 logger.info("%s is the month's first session; rebalancing.", session)
@@ -109,6 +139,13 @@ def run_daily(
             else:
                 logger.info("No rebalance for %s.", session)
 
+            if dry_run:
+                # Discard everything. A verification run must be observable
+                # only through its logs, never through stored rows.
+                conn.rollback()
+                logger.info("Dry run complete for %s; nothing written.", session)
+                return session
+
             record_run(conn, "success", f"session {session}")
             logger.info("Daily run complete for %s", session)
 
@@ -117,7 +154,8 @@ def run_daily(
             # transaction so the heartbeat survives.
             conn.rollback()
             logger.exception("Daily run failed for %s", session)
-            record_run(conn, "failure", f"session {session}: {exc}")
+            if not dry_run:
+                record_run(conn, "failure", f"session {session}: {exc}")
             raise
 
     return session
