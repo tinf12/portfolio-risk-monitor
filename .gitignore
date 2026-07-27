@@ -1,0 +1,18 @@
+.env
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Scratch copies of the database. data/risk.db IS committed; see CLAUDE.md.
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/scratch/
+
+.DS_Store
+.vscode/
+.idea/

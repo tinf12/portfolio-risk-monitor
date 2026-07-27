@@ -1,0 +1,84 @@
+name: Daily risk snapshot
+
+on:
+  schedule:
+    # 11:00 UTC on weekdays: after the US close in every DST offset, and early
+    # enough that the previous session's SIP data is well past the 15-minute
+    # embargo. Runs are commonly delayed 10-30 minutes; nothing here assumes
+    # exact timing. Monday's run processes Friday's session, which is correct.
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Session to process (YYYY-MM-DD). Blank = last completed."
+        required: false
+      skip_orders:
+        description: "Snapshot only, never rebalance"
+        type: boolean
+        default: false
+
+# Serialise runs. Two jobs writing data/risk.db concurrently would produce a
+# conflict git cannot merge (CLAUDE.md, "Committing data/risk.db").
+concurrency:
+  group: daily-risk-snapshot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily job
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          python -m src.jobs.daily \
+            ${{ inputs.date && format('--date {0}', inputs.date) || '' }} \
+            ${{ inputs.skip_orders && '--skip-orders' || '' }}
+
+      # Runs even when the job above fails, so the failure heartbeat reaches
+      # the repo. Without it a failed run is invisible: GitHub sends no
+      # notification for a failed scheduled workflow.
+      - name: Commit database
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- data/risk.db; then
+            echo "No database changes to commit."
+            exit 0
+          fi
+
+          git add data/risk.db
+          git commit -m "data: daily snapshot $(date -u +%Y-%m-%d)"
+
+          # CI is the only committing writer, but a manual dispatch can race a
+          # scheduled run. Rebase rather than merge; the DB is binary and a
+          # merge commit would be unresolvable.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && \
+               git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; retrying."
+            sleep 5
+          done
+          echo "Could not push after 3 attempts." >&2
+          exit 1
