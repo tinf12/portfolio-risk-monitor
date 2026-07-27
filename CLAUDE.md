@@ -70,7 +70,7 @@ the mechanism behind an unexpected result.
 
 | Component | Choice | Notes |
 |---|---|---|
-| Language | Python 3.12 | 3.11+ acceptable |
+| Language | Python 3.14 | Local, CI, and Streamlit Cloud must all match |
 | Broker + data | Alpaca paper trading (`alpaca-py`) | Free; $100k default balance |
 | Compute | pandas, NumPy | |
 | Statistics | SciPy | chi-square for Kupiec test |
