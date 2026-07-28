@@ -5,14 +5,18 @@ Order of operations, and why:
 1. Resolve the target session — the last *completed* one, never today's.
 2. Fetch and store closes for all 11 tickers.
 3. Snapshot account and positions, store them, compute P&L.
-4. Rebalance if the target session is the month's first.
-5. Record a heartbeat row either way.
+4. Compute and store risk estimates from the stored return series.
+5. Rebalance if the target session is the month's first.
+6. Record a heartbeat row either way.
 
-Step 5 runs even on failure. GitHub does not notify on a failed scheduled
+Step 6 runs even on failure. GitHub does not notify on a failed scheduled
 workflow, so an absent or failed `runs` row is the only failure signal
 (CLAUDE.md, "GitHub Actions").
 
-Risk metrics are deliberately not computed here yet — that is Phase 2.
+Step 4 follows step 3 because VaR is scaled by the total_value written there,
+and estimated from the return series that step just extended. It precedes the
+rebalance so the estimate describes the portfolio as it stood at the close,
+not the one the next morning's orders will create.
 """
 
 from __future__ import annotations
@@ -20,26 +24,130 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
+import sqlite3
 import sys
 
 from src.data.bars import fetch_daily_closes, missing_symbols
 from src.data.calendar import (
     is_first_trading_day_of_month,
     most_recent_completed_session,
+    next_trading_day,
 )
 from src.db.connection import get_connection
 from src.db.upserts import (
     get_previous_total_value,
+    get_return_series,
     insert_prices,
     record_run,
     upsert_portfolio_pnl,
     upsert_positions,
+    upsert_risk_estimates,
 )
 from src.portfolio.orders import submit_orders
 from src.portfolio.positions import fetch_account_snapshot
 from src.portfolio.rebalance import compute_orders, target_quantities
+from src.risk.expected_shortfall import expected_shortfall
+from src.risk.var import historical_var, parametric_var
 
 logger = logging.getLogger(__name__)
+
+# Windows to estimate over. Both are written for every session that has enough
+# history, and coexist in risk_estimates because lookback_days is part of its
+# key -- so the two can be compared rather than one replacing the other.
+#
+# The choice of windows is a methodology decision, not plumbing: 250 is roughly
+# a trading year and is the conventional default; 30 exists so the live series
+# produces a figure about six weeks in rather than months.
+#
+# 30 is a floor, not a preference. Below 25 the nearest-rank tail collapses:
+# ceil(0.05 * 20) and ceil(0.01 * 20) are both 1, so the 95% and 99% estimates
+# would read the same single observation and report identical numbers while
+# looking like two independent measurements. At 30 they are 2 and 1 -- still
+# thin, and the 99% figure is exactly its worst day, which is a caveat for the
+# README rather than a reason to withhold the number.
+LOOKBACK_WINDOWS = (30, 250)
+
+CONFIDENCE_LEVELS = (0.95, 0.99)
+
+
+def _write_risk_estimates(
+    conn: sqlite3.Connection,
+    session: str,
+    total_value: float,
+) -> int:
+    """Estimate and store VaR/ES for `session`, returning the row count.
+
+    Reads the return series ending at `session`, so a figure only ever uses
+    information available at that close. `applies_to_date` is the next NYSE
+    session -- the day the estimate predicts. Computing it as session + 1 day
+    would point at weekends and holidays, and rows pointing at a non-trading
+    day can never breach, which biases the Kupiec test toward acceptance
+    (CLAUDE.md, "Temporal convention").
+
+    Windows with too little history are skipped with a log line rather than
+    estimated from whatever happens to be there: a VaR from 12 observations is
+    not a weaker number, it is a different claim.
+
+    Expected shortfall is stored only for the historical rows. Parametric ES
+    has a closed form under the normal assumption, but choosing and writing it
+    is a methodology decision reserved to the author (CLAUDE.md, "Author
+    boundary"), so those rows carry NULL rather than a figure this job
+    invented. The column is nullable for exactly this reason.
+    """
+    applies_to = next_trading_day(session)
+    rows: list[tuple[str, str, str, float, float, float | None, int]] = []
+
+    for window in LOOKBACK_WINDOWS:
+        returns = get_return_series(conn, session, window)
+        if len(returns) < window:
+            logger.info(
+                "Skipping %d-day estimates for %s: %d of %d returns available.",
+                window,
+                session,
+                len(returns),
+                window,
+            )
+            continue
+
+        for confidence in CONFIDENCE_LEVELS:
+            rows.append((
+                session,
+                applies_to,
+                "historical",
+                confidence,
+                historical_var(returns, confidence, total_value),
+                expected_shortfall(returns, confidence, total_value),
+                window,
+            ))
+            rows.append((
+                session,
+                applies_to,
+                "parametric",
+                confidence,
+                parametric_var(returns, confidence, total_value),
+                None,
+                window,
+            ))
+
+    if not rows:
+        logger.info("No risk estimates for %s; insufficient history.", session)
+        return 0
+
+    result = upsert_risk_estimates(conn, rows)
+    if result.has_changes:
+        # Same inputs must give the same output. A moved value without a code
+        # change means determinism broke somewhere upstream.
+        for as_of, method, conf, window, stored, incoming in result.changed:
+            logger.warning(
+                "Risk estimate changed on re-run: %s %s %.2f %dd, %.4f -> %.4f",
+                as_of, method, conf, window, stored, incoming,
+            )
+
+    logger.info(
+        "Wrote %d risk estimate(s) for %s (applies to %s).",
+        len(rows), session, applies_to,
+    )
+    return len(rows)
 
 
 def run_daily(
@@ -123,6 +231,10 @@ def run_daily(
                     daily_pnl=daily_pnl,
                     daily_return=daily_return,
                 )
+
+                # After the P&L write, so today's return is in the window, and
+                # scaled by the total_value just stored for this session.
+                _write_risk_estimates(conn, session, snapshot.total_value)
             else:
                 logger.warning(
                     "Skipped positions and P&L for %s; account state is live.",

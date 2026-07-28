@@ -145,6 +145,132 @@ def upsert_portfolio_pnl(
     )
 
 
+@dataclass
+class RiskWriteResult:
+    """Outcome of a risk-estimate write.
+
+    `changed` lists rows whose stored value moved on a re-run, as
+    (as_of_date, method, confidence, lookback_days, stored, incoming).
+
+    Re-running a session must reproduce its figures exactly (CLAUDE.md
+    constraint 1, and the Phase 2 "done when"). Nothing here blocks an
+    overwrite — a deliberate methodology fix should be able to land — but a
+    value that moves without a code change is the signal that determinism
+    broke, so it is surfaced rather than absorbed silently.
+    """
+
+    inserted: int = 0
+    unchanged: int = 0
+    changed: list[tuple[str, str, float, int, float, float]] = field(
+        default_factory=list
+    )
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.changed)
+
+
+def upsert_risk_estimates(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[str, str, str, float, float, float | None, int]],
+) -> RiskWriteResult:
+    """Insert or refresh risk estimates, reporting any value that moved.
+
+    Each row is
+    (as_of_date, applies_to_date, method, confidence, var_amount, es_amount,
+    lookback_days), matching the column order of `risk_estimates`.
+
+    `var_amount` is a positive loss magnitude. `es_amount` may be None; the
+    column is nullable and not every method supplies one.
+
+    The (as_of_date, method, confidence, lookback_days) key means estimates
+    from different windows coexist for the same date rather than overwriting
+    each other, so a 60-day and a 250-day figure can be compared directly.
+
+    `applies_to_date` is not part of the key: it is a function of as_of_date
+    via the NYSE calendar, so a row cannot disagree with itself about which
+    day it predicts.
+    """
+    result = RiskWriteResult()
+
+    for row in rows:
+        as_of, applies_to, method, confidence, var_amount, es_amount, lookback = row
+
+        existing = conn.execute(
+            """
+            SELECT var_amount FROM risk_estimates
+            WHERE as_of_date = ? AND method = ? AND confidence = ?
+              AND lookback_days = ?
+            """,
+            (as_of, method, confidence, lookback),
+        ).fetchone()
+
+        if existing is None:
+            result.inserted += 1
+        else:
+            stored = float(existing["var_amount"])
+            if abs(stored - var_amount) <= RESTATEMENT_TOLERANCE:
+                result.unchanged += 1
+            else:
+                result.changed.append(
+                    (as_of, method, confidence, lookback, stored, var_amount)
+                )
+
+        conn.execute(
+            """
+            INSERT INTO risk_estimates
+              (as_of_date, applies_to_date, method, confidence, var_amount,
+               es_amount, lookback_days)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (as_of_date, method, confidence, lookback_days)
+            DO UPDATE SET
+              applies_to_date = excluded.applies_to_date,
+              var_amount      = excluded.var_amount,
+              es_amount       = excluded.es_amount
+            """,
+            row,
+        )
+
+    return result
+
+
+def get_return_series(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    lookback_days: int,
+) -> list[float]:
+    """Return up to `lookback_days` daily returns ending at `as_of_date`.
+
+    Ordered oldest to newest, though the risk functions sort internally and do
+    not depend on it.
+
+    Two filters carry the temporal guarantees:
+
+    - `trade_date <= as_of_date` — an estimate for as_of_date may only use
+      information available at that close. Widening this to `<` on a later
+      date, or dropping it, is lookahead bias and will not raise.
+    - `daily_return IS NOT NULL` — the first stored row has no prior day to
+      difference against. The risk functions reject non-finite input rather
+      than dropping it, so the trim happens here, where the caller can see
+      that a row was skipped for a structural reason and not a data fault.
+
+    Returns fewer than `lookback_days` values when history is short. The
+    caller decides whether that is enough; this function does not guess.
+    """
+    rows = conn.execute(
+        """
+        SELECT daily_return
+        FROM portfolio_pnl
+        WHERE trade_date <= ? AND daily_return IS NOT NULL
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        (as_of_date, lookback_days),
+    ).fetchall()
+
+    return [float(row["daily_return"]) for row in reversed(rows)]
+
+
 def record_run(
     conn: sqlite3.Connection,
     status: str,
