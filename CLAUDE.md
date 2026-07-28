@@ -139,9 +139,15 @@ Verified July 2026. Re-check before relying on any of it.
 - Cron is UTC. Minimum interval is 5 minutes.
 - Scheduled runs are commonly delayed 10 to 30 minutes at peak load. Never
   assume exact execution time.
-- GitHub sends no notification when a scheduled workflow fails. The `runs`
-  table and a "last successful run" indicator on the dashboard are the
-  substitute. Treat this as a requirement, not a nice-to-have.
+- Failure notification for a scheduled workflow reaches one person at most: the
+  account that created it, last edited the cron, or last re-enabled it, and only
+  if that account has the notification enabled. Nobody else is told, and a run
+  that never starts produces no notification at all. The `runs` table and a
+  "last successful run" indicator on the dashboard are the substitute. Treat
+  this as a requirement, not a nice-to-have.
+- GitHub disables scheduled workflows on repositories with no recent activity
+  (60 days). A successful scheduled run does not itself count as activity, so
+  the job can stop with nothing in the YAML looking wrong.
 
 **Streamlit Community Cloud**
 - Roughly 1 GB memory. Apps sleep after 12 hours without traffic.
