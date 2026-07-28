@@ -37,17 +37,21 @@ from src.db.connection import get_connection
 from src.db.upserts import (
     get_previous_total_value,
     get_return_series,
+    get_symbol_return_series,
     get_total_value_series,
+    get_var_amount,
     insert_prices,
     record_run,
     upsert_portfolio_metrics,
     upsert_portfolio_pnl,
     upsert_positions,
+    upsert_risk_contributions,
     upsert_risk_estimates,
 )
 from src.portfolio.orders import submit_orders
-from src.portfolio.positions import fetch_account_snapshot
+from src.portfolio.positions import AccountSnapshot, fetch_account_snapshot
 from src.portfolio.rebalance import compute_orders, target_quantities
+from src.risk.contribution import historical_contribution
 from src.risk.expected_shortfall import expected_shortfall
 from src.risk.metrics import current_drawdown, rolling_volatility
 from src.risk.var import historical_var, parametric_var
@@ -75,6 +79,35 @@ CONFIDENCE_LEVELS = (0.95, 0.99)
 # Named to match portfolio_metrics.vol_20d. Changing one without the other puts
 # a window in the column that its name denies.
 VOL_WINDOW = 20
+
+# Cash is carried as a position with a constant zero return. It is part of the
+# portfolio, it has no price risk, and holding it is exactly why the portfolio's
+# VaR is lower than a fully invested one's. Modelling it explicitly keeps the
+# weights summing to 1.0 without normalising the sleeves, which would decompose
+# a fully-invested portfolio that is not the one being held.
+CASH_SYMBOL = "CASH"
+
+# Two different checks, because two different things can be wrong.
+#
+# Contributions decompose the portfolio return implied by *today's* weights
+# applied to each symbol's historical returns. Against that series the
+# decomposition is exact by construction, so any gap beyond float noise is a
+# genuine defect -- a dropped symbol, a weight that does not match its return
+# series, a misaligned window. Fatal.
+ADDITIVITY_TOLERANCE = 1e-6
+
+# The stored var_amount is a different series: account equity, which reflects
+# the weights as they actually were on each past day, plus cash drag, dividends
+# and execution costs. Equal-weight sleeves drift between monthly rebalances, so
+# the two disagree by more than rounding -- measured at 0.5% at 95% confidence
+# and 4% at 99%, where the estimate rests on a single day with no averaging to
+# wash the drift out.
+#
+# That gap is a real property of the portfolio and is logged rather than scaled
+# away: rescaling would tie the table out at the cost of making every figure in
+# it slightly fictional. It only becomes evidence of a fault when it is far
+# larger than drift can explain.
+DRIFT_ALERT_THRESHOLD = 0.25
 
 
 def _write_risk_estimates(
@@ -154,6 +187,133 @@ def _write_risk_estimates(
         "Wrote %d risk estimate(s) for %s (applies to %s).",
         len(rows), session, applies_to,
     )
+    return len(rows)
+
+
+def _write_risk_contributions(
+    conn: sqlite3.Connection,
+    session: str,
+    snapshot: AccountSnapshot,
+) -> int:
+    """Decompose each stored historical VaR figure across the positions held.
+
+    Weights come from the account snapshot, with cash as a zero-return position
+    so they sum to 1.0 (see CASH_SYMBOL). Per-symbol returns come from stored
+    closes, so this decomposes the price-only relationship between positions and
+    the portfolio.
+
+    Only windows and confidence levels that already have a stored historical
+    estimate are decomposed: a contribution row exists to explain a specific
+    var_amount, so writing one with nothing to join to would be meaningless.
+
+    Raises:
+        RuntimeError: If the contributions miss the stored var_amount by more
+            than RESIDUAL_TOLERANCE. Small residuals are cash drag and
+            dividends; a large one means the decomposition is not describing
+            the portfolio the estimate was computed from.
+    """
+    if not snapshot.positions:
+        logger.info("No positions on %s; nothing to decompose.", session)
+        return 0
+
+    weights = {
+        symbol: market_value / snapshot.total_value
+        for symbol, _qty, market_value in snapshot.positions
+    }
+    weights[CASH_SYMBOL] = snapshot.cash / snapshot.total_value
+
+    rows: list[tuple[str, str, float, float | None, float, str, float, int]] = []
+
+    for window in LOOKBACK_WINDOWS:
+        returns_by_symbol = get_symbol_return_series(conn, session, window)
+        if not returns_by_symbol:
+            logger.info(
+                "No %d-day contributions for %s: incomplete price history.",
+                window, session,
+            )
+            continue
+
+        # Cash earns nothing and moves nothing, on every day in the window.
+        returns_by_symbol[CASH_SYMBOL] = [0.0] * window
+
+        if set(returns_by_symbol) != set(weights):
+            logger.warning(
+                "Skipping %d-day contributions for %s: priced symbols %s do not "
+                "match held positions %s.",
+                window, session, sorted(returns_by_symbol), sorted(weights),
+            )
+            continue
+
+        # The portfolio return series these contributions actually decompose:
+        # today's weights applied to each symbol's history.
+        implied = [
+            sum(returns_by_symbol[s][t] * weights[s] for s in weights)
+            for t in range(window)
+        ]
+
+        for confidence in CONFIDENCE_LEVELS:
+            var_amount = get_var_amount(
+                conn, session, "historical", confidence, window
+            )
+            if var_amount is None:
+                continue
+
+            contributions = historical_contribution(
+                returns_by_symbol, weights, confidence, snapshot.total_value
+            )
+            total = sum(contributions.values())
+
+            # Check 1: internal additivity. Exact by construction, so any gap
+            # here is a defect rather than a modelling difference.
+            implied_var = historical_var(implied, confidence, snapshot.total_value)
+            if abs(total - implied_var) > ADDITIVITY_TOLERANCE * max(
+                abs(implied_var), 1.0
+            ):
+                raise RuntimeError(
+                    f"Contributions for {session} at {confidence} over {window}d "
+                    f"sum to {total:.6f}, but the portfolio VaR implied by the "
+                    f"same weights and returns is {implied_var:.6f}. The "
+                    f"decomposition is not describing its own inputs."
+                )
+
+            # Check 2: distance from the stored figure. Expected to be non-zero
+            # (weight drift, cash drag, dividends) and recorded so the size of
+            # that effect is visible rather than assumed.
+            drift = total - var_amount
+            drift_pct = drift / var_amount if var_amount else 0.0
+            if abs(drift_pct) > DRIFT_ALERT_THRESHOLD:
+                raise RuntimeError(
+                    f"Contributions for {session} at {confidence} over {window}d "
+                    f"sum to {total:.2f} against a stored var_amount of "
+                    f"{var_amount:.2f} ({drift_pct:+.1%}). Weight drift and cash "
+                    f"drag do not explain a gap this size."
+                )
+
+            logger.info(
+                "Contributions for %s at %.2f over %dd: sum %.2f, "
+                "stored var_amount %.2f, drift %+.2f (%+.2f%%).",
+                session, confidence, window, total, var_amount,
+                drift, drift_pct * 100,
+            )
+
+            rows.extend(
+                (
+                    session,
+                    symbol,
+                    weights[symbol],
+                    None,  # marginal_var: see upsert_risk_contributions
+                    amount,
+                    "historical",
+                    confidence,
+                    window,
+                )
+                for symbol, amount in sorted(contributions.items())
+            )
+
+    if rows:
+        upsert_risk_contributions(conn, rows)
+        logger.info("Wrote %d contribution row(s) for %s.", len(rows), session)
+
     return len(rows)
 
 
@@ -277,6 +437,7 @@ def run_daily(
                 # After the P&L write, so today's return is in the window, and
                 # scaled by the total_value just stored for this session.
                 _write_risk_estimates(conn, session, snapshot.total_value)
+                _write_risk_contributions(conn, session, snapshot)
                 _write_portfolio_metrics(conn, session)
             else:
                 logger.warning(
