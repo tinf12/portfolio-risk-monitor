@@ -5,11 +5,11 @@ VaR answers "how bad is a bad day?" — it names a threshold and stops. ES answe
 beyond the VaR threshold. So ES sees the shape of the tail, where VaR only sees
 its edge, and ES is never smaller than the VaR it extends.
 
-This module is deliberately self-contained: it re-derives the tail cutoff rather
-than importing from `src.risk.var`. Both modules must use the same percentile
-convention (nearest-rank, see `_tail_count`) or the ES >= VaR relationship can
-invert on small samples. That duplication is the price of being able to reason
-about each file on its own; the shared convention is the thing to keep in sync.
+The tail cutoff and the input guards come from `src.risk._common`, shared with
+`src.risk.var`. They have to be one definition rather than two copies: if the
+two modules ever disagreed about where the tail starts, the guarantee that
+ES >= VaR could invert on small samples, silently and in the direction that
+flatters the model.
 
 Pure functions only: no I/O, no clock reads, no randomness. Given the same
 returns the result is bit-identical every time (CLAUDE.md constraint 1).
@@ -17,69 +17,9 @@ returns the result is bit-identical every time (CLAUDE.md constraint 1).
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
-# Below this many observations the tail is not being estimated, it is being
-# guessed. Deliberately permissive: the honest guidance ("99% from 250 days
-# rests on 2-3 observations") belongs in the README, not in a hard rejection.
-MIN_OBSERVATIONS = 20
-
-
-def _tail_count(n: int, confidence: float) -> int:
-    """How many of the worst observations make up the (1 - confidence) tail.
-
-    Nearest-rank convention: ceil((1 - confidence) * n). At n=100, confidence
-    0.95 this is 5 -- the five worst days out of a hundred.
-
-    The `round` is not cosmetic. (1 - 0.95) is 0.05000000000000004 in binary
-    floating point, so (1 - 0.95) * 100 is 5.000000000000004 and a bare ceil
-    returns 6, silently widening the tail by one observation. Rounding to 9
-    decimals before the ceil removes the representation error while staying far
-    below any confidence level anyone would actually request.
-    """
-    return max(1, math.ceil(round((1 - confidence) * n, 9)))
-
-
-def _validate(returns: Sequence[float], confidence: float, total_value: float) -> None:
-    """Reject inputs that would otherwise produce a plausible wrong number.
-
-    Every check here guards against a silent failure rather than a crash. A
-    risk figure that is wrong but believable gets committed to the database and
-    inherited by the Kupiec test; a raised error gets recorded in `runs` and
-    noticed.
-    """
-    if not returns:
-        raise ValueError("returns is empty; cannot estimate a tail from no data")
-
-    if total_value <= 0:
-        raise ValueError(f"total_value must be positive, got {total_value}")
-
-    # Strictly exclusive. The failure this really catches is a caller passing 95
-    # instead of 0.95: (1 - 95) is negative, and Python's negative indexing
-    # would then return a value from the profitable end of the sorted array
-    # without raising anything at all.
-    if not 0.5 < confidence < 1:
-        raise ValueError(f"confidence must be between 0.5 and 1, got {confidence}")
-
-    # portfolio_pnl.daily_return is NULL on the first row (no prior day to
-    # difference against). Through pandas that NULL arrives as NaN, and NaN
-    # breaks sorting silently -- all NaN comparisons are False, so it neither
-    # sorts nor raises, and every index past it shifts by one.
-    #
-    # Rejecting rather than dropping is deliberate: dropping observations here
-    # would make the caller's stored `lookback_days` disagree with the number of
-    # returns actually used, and that column is part of the primary key of
-    # risk_estimates. Silently storing a row that misstates its own window
-    # breaks the auditability requirement. The caller trims the leading null.
-    for i, r in enumerate(returns):
-        if r is None or not math.isfinite(r):
-            raise ValueError(f"returns[{i}] is {r}; expected a finite number")
-
-    if len(returns) < MIN_OBSERVATIONS:
-        raise ValueError(
-            f"need at least {MIN_OBSERVATIONS} returns, got {len(returns)}"
-        )
+from src.risk._common import _tail_count, _validate
 
 
 def expected_shortfall(
