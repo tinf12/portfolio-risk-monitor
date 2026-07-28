@@ -1,5 +1,7 @@
 from __future__ import annotations 
 import math
+import statistics
+from scipy.stats import norm
 
 def _tail_count(n: int, confidence: float) -> int:
     """How many of the worst observations make up the (1 - confidence) tail.
@@ -20,3 +22,9 @@ def historical_var(returns, confidence, total_value) -> float:
     k = _tail_count(len(ascending), confidence)
     worst_at_threshold = ascending[k-1]
     return -worst_at_threshold * total_value
+
+def parametric_var(returns, confidence, total_value) -> float:
+    mean = statistics.mean(returns)
+    stdev = statistics.stdev(returns)
+    z = norm.ppf(confidence)
+    return -(mean - z * stdev) * total_value
