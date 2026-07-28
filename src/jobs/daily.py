@@ -6,7 +6,8 @@ Order of operations, and why:
 2. Fetch and store closes for all 11 tickers.
 3. Snapshot account and positions, store them, compute P&L.
 4. Compute and store risk estimates and portfolio metrics from stored rows.
-5. Rebalance if the target session is the month's first.
+5. Rebalance if the target session is the month's first, or if the account
+   holds nothing at all.
 6. Record a heartbeat row either way.
 
 Step 6 runs even on failure. GitHub does not notify on a failed scheduled
@@ -445,8 +446,23 @@ def run_daily(
                     session,
                 )
 
-            if is_first_trading_day_of_month(session) and not skip_orders:
-                logger.info("%s is the month's first session; rebalancing.", session)
+            # An empty account is not a portfolio awaiting its next rebalance;
+            # it does not hold the 11 sleeves the spec requires at all. Gating
+            # entry on the monthly date would leave it in cash until the
+            # calendar happened to allow a trade -- up to a month, purely
+            # because of when the account was funded. Treating "holds nothing"
+            # as its own trigger makes the spec self-healing: if positions are
+            # ever liquidated, the next run restores them.
+            is_rebalance_day = is_first_trading_day_of_month(session)
+            is_empty = not snapshot.positions
+
+            if (is_rebalance_day or is_empty) and not skip_orders:
+                reason = (
+                    "the month's first session"
+                    if is_rebalance_day
+                    else "the account holds no positions"
+                )
+                logger.info("Trading for %s: %s.", session, reason)
                 prices = {symbol: close for _, symbol, close in price_rows}
                 targets = target_quantities(snapshot.total_value, prices)
                 current = {sym: qty for sym, qty, _ in snapshot.positions}
