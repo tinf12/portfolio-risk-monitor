@@ -5,7 +5,7 @@ Order of operations, and why:
 1. Resolve the target session — the last *completed* one, never today's.
 2. Fetch and store closes for all 11 tickers.
 3. Snapshot account and positions, store them, compute P&L.
-4. Compute and store risk estimates from the stored return series.
+4. Compute and store risk estimates and portfolio metrics from stored rows.
 5. Rebalance if the target session is the month's first.
 6. Record a heartbeat row either way.
 
@@ -37,8 +37,10 @@ from src.db.connection import get_connection
 from src.db.upserts import (
     get_previous_total_value,
     get_return_series,
+    get_total_value_series,
     insert_prices,
     record_run,
+    upsert_portfolio_metrics,
     upsert_portfolio_pnl,
     upsert_positions,
     upsert_risk_estimates,
@@ -47,6 +49,7 @@ from src.portfolio.orders import submit_orders
 from src.portfolio.positions import fetch_account_snapshot
 from src.portfolio.rebalance import compute_orders, target_quantities
 from src.risk.expected_shortfall import expected_shortfall
+from src.risk.metrics import current_drawdown, rolling_volatility
 from src.risk.var import historical_var, parametric_var
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,10 @@ logger = logging.getLogger(__name__)
 LOOKBACK_WINDOWS = (30, 250)
 
 CONFIDENCE_LEVELS = (0.95, 0.99)
+
+# Named to match portfolio_metrics.vol_20d. Changing one without the other puts
+# a window in the column that its name denies.
+VOL_WINDOW = 20
 
 
 def _write_risk_estimates(
@@ -148,6 +155,41 @@ def _write_risk_estimates(
         len(rows), session, applies_to,
     )
     return len(rows)
+
+
+def _write_portfolio_metrics(conn: sqlite3.Connection, session: str) -> None:
+    """Compute and store volatility, drawdown, and peak for `session`.
+
+    Unlike the risk estimates, these describe `session` itself rather than
+    predicting the next day, which is why portfolio_metrics is keyed on
+    as_of_date alone and carries no applies_to_date.
+
+    The two inputs are different series, and confusing them is the way this
+    goes wrong: volatility is the dispersion of *returns*, drawdown is a
+    position within the history of *levels*. Drawdown reads the full stored
+    history because its peak is all-time; a trailing peak would understate the
+    decline.
+
+    vol_20d is stored as None until 20 returns exist. Drawdown is meaningful
+    from the first row, so it is always written.
+    """
+    returns = get_return_series(conn, session, VOL_WINDOW)
+    values = get_total_value_series(conn, session)
+
+    vol = rolling_volatility(returns, window=VOL_WINDOW)
+    if vol is None:
+        logger.info(
+            "No %d-day volatility for %s: %d of %d returns available.",
+            VOL_WINDOW, session, len(returns), VOL_WINDOW,
+        )
+
+    drawdown, peak = current_drawdown(values)
+    upsert_portfolio_metrics(conn, session, vol, drawdown, peak)
+
+    logger.info(
+        "Metrics for %s: vol_20d=%s drawdown=%.4f peak=%.2f",
+        session, "None" if vol is None else f"{vol:.4f}", drawdown, peak,
+    )
 
 
 def run_daily(
@@ -235,6 +277,7 @@ def run_daily(
                 # After the P&L write, so today's return is in the window, and
                 # scaled by the total_value just stored for this session.
                 _write_risk_estimates(conn, session, snapshot.total_value)
+                _write_portfolio_metrics(conn, session)
             else:
                 logger.warning(
                     "Skipped positions and P&L for %s; account state is live.",

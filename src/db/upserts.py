@@ -271,6 +271,66 @@ def get_return_series(
     return [float(row["daily_return"]) for row in reversed(rows)]
 
 
+def upsert_portfolio_metrics(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    vol_20d: float | None,
+    drawdown: float,
+    peak_value: float,
+) -> None:
+    """Insert or replace one day of portfolio-level metrics.
+
+    `vol_20d` is None until 20 returns exist. The column is nullable for that
+    reason: a figure computed from a shorter window would be a false claim in a
+    column named for a 20-day one.
+
+    `drawdown` is negative or zero, the opposite of the positive-loss convention
+    used for var_amount. Both are deliberate and both are in the schema.
+
+    An upsert rather than write-once: these are derived entirely from stored
+    rows, so recomputing them cannot lose information the way restating a vendor
+    close would.
+    """
+    conn.execute(
+        """
+        INSERT INTO portfolio_metrics (as_of_date, vol_20d, drawdown, peak_value)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (as_of_date) DO UPDATE SET
+          vol_20d    = excluded.vol_20d,
+          drawdown   = excluded.drawdown,
+          peak_value = excluded.peak_value
+        """,
+        (as_of_date, vol_20d, drawdown, peak_value),
+    )
+
+
+def get_total_value_series(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+) -> list[float]:
+    """Return every stored total_value through `as_of_date`, oldest first.
+
+    Unwindowed on purpose. Drawdown is measured against the all-time high, and
+    a peak taken over a trailing window instead would understate the decline --
+    the direction that flatters the portfolio.
+
+    `trade_date <= as_of_date` carries the same no-lookahead guarantee as
+    get_return_series: a metric for a date may not see a value recorded after
+    it.
+    """
+    rows = conn.execute(
+        """
+        SELECT total_value
+        FROM portfolio_pnl
+        WHERE trade_date <= ?
+        ORDER BY trade_date
+        """,
+        (as_of_date,),
+    ).fetchall()
+
+    return [float(row["total_value"]) for row in rows]
+
+
 def record_run(
     conn: sqlite3.Connection,
     status: str,
