@@ -17,6 +17,8 @@ import pytest
 
 from src.db.upserts import (
     get_return_series,
+    get_total_value_series,
+    upsert_portfolio_metrics,
     upsert_portfolio_pnl,
     upsert_risk_estimates,
 )
@@ -151,3 +153,52 @@ class TestUpsertRiskEstimates:
         ).fetchone()
         assert row["as_of_date"] == "2026-07-24"      # Friday
         assert row["applies_to_date"] == "2026-07-27"  # Monday, not Saturday
+
+
+class TestTotalValueSeries:
+    def test_oldest_first_and_unwindowed(self, pnl: sqlite3.Connection) -> None:
+        """Drawdown needs the all-time peak, so this series is never trimmed."""
+        got = get_total_value_series(pnl, "2026-07-27")
+        assert len(got) == 5  # the NULL-return seed row counts: it has a value
+        assert got[0] == pytest.approx(100_000.0)
+
+    def test_stops_at_as_of_date(self, pnl: sqlite3.Connection) -> None:
+        """Same no-lookahead boundary as the return series."""
+        assert len(get_total_value_series(pnl, "2026-07-23")) == 3
+
+    def test_includes_the_null_return_row(self, pnl: sqlite3.Connection) -> None:
+        """Unlike returns, the first row's total_value is a real observation --
+        it just has no prior day to difference against. Dropping it would lower
+        the peak and understate every later drawdown."""
+        assert get_total_value_series(pnl, "2026-07-22")[0] == pytest.approx(
+            100_000.0
+        )
+
+    def test_empty_before_any_history(self, pnl: sqlite3.Connection) -> None:
+        assert get_total_value_series(pnl, "2026-01-01") == []
+
+
+class TestPortfolioMetrics:
+    def test_writes_a_row(self, conn: sqlite3.Connection) -> None:
+        upsert_portfolio_metrics(conn, "2026-07-27", 0.1629, -0.25, 120_000.0)
+        row = conn.execute("SELECT * FROM portfolio_metrics").fetchone()
+        assert row["vol_20d"] == pytest.approx(0.1629)
+        assert row["drawdown"] == pytest.approx(-0.25)
+        assert row["peak_value"] == pytest.approx(120_000.0)
+
+    def test_null_vol_is_allowed(self, conn: sqlite3.Connection) -> None:
+        """vol_20d is None until 20 returns exist; a figure from a shorter
+        window would be a false claim in a column named for a 20-day one."""
+        upsert_portfolio_metrics(conn, "2026-07-27", None, 0.0, 100_000.0)
+        row = conn.execute("SELECT vol_20d FROM portfolio_metrics").fetchone()
+        assert row["vol_20d"] is None
+
+    def test_rerun_replaces_rather_than_duplicates(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        upsert_portfolio_metrics(conn, "2026-07-27", None, 0.0, 100_000.0)
+        upsert_portfolio_metrics(conn, "2026-07-27", 0.1629, -0.25, 120_000.0)
+
+        rows = conn.execute("SELECT * FROM portfolio_metrics").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["vol_20d"] == pytest.approx(0.1629)

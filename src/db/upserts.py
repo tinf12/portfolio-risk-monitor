@@ -271,6 +271,180 @@ def get_return_series(
     return [float(row["daily_return"]) for row in reversed(rows)]
 
 
+def upsert_portfolio_metrics(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    vol_20d: float | None,
+    drawdown: float,
+    peak_value: float,
+) -> None:
+    """Insert or replace one day of portfolio-level metrics.
+
+    `vol_20d` is None until 20 returns exist. The column is nullable for that
+    reason: a figure computed from a shorter window would be a false claim in a
+    column named for a 20-day one.
+
+    `drawdown` is negative or zero, the opposite of the positive-loss convention
+    used for var_amount. Both are deliberate and both are in the schema.
+
+    An upsert rather than write-once: these are derived entirely from stored
+    rows, so recomputing them cannot lose information the way restating a vendor
+    close would.
+    """
+    conn.execute(
+        """
+        INSERT INTO portfolio_metrics (as_of_date, vol_20d, drawdown, peak_value)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (as_of_date) DO UPDATE SET
+          vol_20d    = excluded.vol_20d,
+          drawdown   = excluded.drawdown,
+          peak_value = excluded.peak_value
+        """,
+        (as_of_date, vol_20d, drawdown, peak_value),
+    )
+
+
+def get_total_value_series(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+) -> list[float]:
+    """Return every stored total_value through `as_of_date`, oldest first.
+
+    Unwindowed on purpose. Drawdown is measured against the all-time high, and
+    a peak taken over a trailing window instead would understate the decline --
+    the direction that flatters the portfolio.
+
+    `trade_date <= as_of_date` carries the same no-lookahead guarantee as
+    get_return_series: a metric for a date may not see a value recorded after
+    it.
+    """
+    rows = conn.execute(
+        """
+        SELECT total_value
+        FROM portfolio_pnl
+        WHERE trade_date <= ?
+        ORDER BY trade_date
+        """,
+        (as_of_date,),
+    ).fetchall()
+
+    return [float(row["total_value"]) for row in rows]
+
+
+def upsert_risk_contributions(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[str, str, float, float | None, float, str, float, int]],
+) -> int:
+    """Insert or refresh per-position risk contributions.
+
+    Each row is (as_of_date, symbol, weight, marginal_var, contribution,
+    method, confidence, lookback_days), matching the column order of
+    `risk_contributions`.
+
+    The method/confidence/lookback_days triple is carried so a contribution row
+    always joins back to the `risk_estimates` row it decomposes.
+
+    `marginal_var` is nullable and currently written as None. Marginal VaR is
+    the derivative of portfolio VaR with respect to a position's weight -- a
+    different quantity from the component contribution stored here, with no
+    clean single-day form. An invented figure in that column would be worse
+    than an empty one.
+    """
+    conn.executemany(
+        """
+        INSERT INTO risk_contributions
+          (as_of_date, symbol, weight, marginal_var, contribution, method,
+           confidence, lookback_days)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (as_of_date, symbol, method, confidence, lookback_days)
+        DO UPDATE SET
+          weight       = excluded.weight,
+          marginal_var = excluded.marginal_var,
+          contribution = excluded.contribution
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def get_symbol_return_series(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    lookback_days: int,
+) -> dict[str, list[float]]:
+    """Per-symbol daily returns from stored closes, ending at `as_of_date`.
+
+    Returns {symbol: [oldest, ..., newest]} with exactly `lookback_days` values
+    per symbol, or {} when there is not enough complete history.
+
+    Computed from `prices` rather than read from a table, because per-symbol
+    returns are not stored anywhere -- only portfolio-level ones are. Producing
+    n returns needs n+1 closes.
+
+    Only dates where **every** symbol has a close are used. A date with partial
+    coverage is dropped rather than filled: a missing bar would otherwise
+    become a fabricated 0% return for that symbol on that day, which would
+    understate its contribution. Dropping keeps every symbol's series aligned to
+    the same calendar, which is what makes the k-th worst day the same day for
+    all of them.
+
+    `trade_date <= as_of_date` carries the same no-lookahead guarantee as the
+    portfolio-level readers.
+    """
+    rows = conn.execute(
+        """
+        SELECT trade_date, symbol, close
+        FROM prices
+        WHERE trade_date <= ?
+        ORDER BY trade_date
+        """,
+        (as_of_date,),
+    ).fetchall()
+
+    if not rows:
+        return {}
+
+    symbols = {row["symbol"] for row in rows}
+    by_date: dict[str, dict[str, float]] = {}
+    for row in rows:
+        by_date.setdefault(row["trade_date"], {})[row["symbol"]] = float(row["close"])
+
+    complete = [d for d in sorted(by_date) if set(by_date[d]) == symbols]
+
+    # n returns need n+1 closes.
+    if len(complete) < lookback_days + 1:
+        return {}
+
+    window = complete[-(lookback_days + 1):]
+    series: dict[str, list[float]] = {}
+    for symbol in symbols:
+        closes = [by_date[d][symbol] for d in window]
+        series[symbol] = [
+            closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))
+        ]
+
+    return series
+
+
+def get_var_amount(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    method: str,
+    confidence: float,
+    lookback_days: int,
+) -> float | None:
+    """Return a stored var_amount, or None when that estimate was not written."""
+    row = conn.execute(
+        """
+        SELECT var_amount FROM risk_estimates
+        WHERE as_of_date = ? AND method = ? AND confidence = ?
+          AND lookback_days = ?
+        """,
+        (as_of_date, method, confidence, lookback_days),
+    ).fetchone()
+    return float(row["var_amount"]) if row is not None else None
+
+
 def record_run(
     conn: sqlite3.Connection,
     status: str,
