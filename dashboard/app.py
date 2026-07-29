@@ -37,6 +37,27 @@ DEFAULT_DB = REPO_ROOT / "data" / "risk.db"
 # enough that a visitor after the daily run sees fresh rows.
 CACHE_TTL_SECONDS = 300
 
+# Windows that failed Kupiec at every method and confidence level on replay, and
+# are shown as diagnostics rather than as risk figures.
+#
+# The 30-day window rejects at 6.79% / 3.85% (historical) and 6.95% / 3.05%
+# (parametric) against 5% and 1% claims. It is still reported because it reacts
+# to a change in volatility within weeks rather than quarters, which the 250-day
+# window cannot do -- but nothing should be sized off it, and a table that
+# presents it identically to a calibrated figure implies otherwise.
+DIAGNOSTIC_WINDOWS = {30}
+
+DIAGNOSTIC_NOTE = (
+    "Diagnostic only — this window fails calibration at every confidence level "
+    "on historical replay. It reacts faster than the 250-day window, which is "
+    "why it is reported, but nothing should be sized off it."
+)
+
+# The full note appears once, next to the window selector. Elsewhere a short
+# marker points back to it: the same paragraph repeated three times on one
+# screen stops being read after the first.
+DIAGNOSTIC_SHORT = "⚠ Diagnostic window — fails calibration on replay; do not size off it."
+
 POSITIVE = "#2E7D32"
 NEGATIVE = "#C62828"
 ACCENT = "#1565C0"
@@ -233,6 +254,9 @@ def render_var_chart(method: str, confidence: float, window: int) -> None:
         """,
         (method, confidence, window),
     )
+    if window in DIAGNOSTIC_WINDOWS:
+        st.warning(DIAGNOSTIC_NOTE)
+
     if df.empty:
         st.info(
             f"No {method} estimates at {confidence:.0%} over {window} days yet. "
@@ -312,14 +336,23 @@ def render_current_estimates() -> None:
         f"Computed from data through **{as_of}**, predicting **{applies_to}**."
     )
 
+    # A window that failed calibration must not sit in the same table as one
+    # that passed with nothing to tell them apart. The marker travels with the
+    # row rather than living only in a caption below it.
     shown = pd.DataFrame({
         "Method": df["method"],
         "Confidence": df["confidence"].map(lambda c: f"{c:.0%}"),
-        "Window": df["lookback_days"].map(lambda w: f"{w}d"),
+        "Window": df["lookback_days"].map(
+            lambda w: f"{w}d ⚠" if w in DIAGNOSTIC_WINDOWS else f"{w}d"
+        ),
         "VaR": df["var_amount"].map(_money),
         "Expected shortfall": df["es_amount"].map(_money),
     })
     st.dataframe(shown, hide_index=True, width="stretch")
+
+    if set(df["lookback_days"]) & DIAGNOSTIC_WINDOWS:
+        st.caption(DIAGNOSTIC_SHORT)
+
     st.caption(
         "Expected shortfall is blank for parametric rows: the closed form under "
         "normality is a modelling choice the project has not made, so the "
@@ -330,6 +363,11 @@ def render_current_estimates() -> None:
 # ------------------------------------------------------------- contributions
 
 def render_contributions(confidence: float, window: int) -> None:
+    if window in DIAGNOSTIC_WINDOWS:
+        st.caption(
+            f"{DIAGNOSTIC_SHORT} These contributions decompose that figure."
+        )
+
     latest = query(
         """
         SELECT MAX(as_of_date) AS d FROM risk_contributions
