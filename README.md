@@ -387,7 +387,7 @@ Live trading began 2026-07-28. The 30-day risk figures appear once 30 sessions
 have accumulated; the 250-day figures are not available until 2027. Until then
 the dashboard's risk panels state that the estimates do not yet exist.
 
-## What I would do next
+## Next Steps
 
 - **Christoffersen's independence test**, to catch the breach clustering Kupiec
   cannot see.
