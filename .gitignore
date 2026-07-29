@@ -16,3 +16,7 @@ data/scratch/
 .DS_Store
 .vscode/
 .idea/
+
+# Editor and agent tooling. CLAUDE.md is committed deliberately — it is the
+# project's constraints, not tooling — but launch configs are local.
+.claude/
