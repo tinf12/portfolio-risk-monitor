@@ -324,10 +324,6 @@ Requires Python 3.14 and an Alpaca paper trading account.
 python -m venv .venv && .venv/Scripts/activate && pip install -r requirements.txt
 ```
 
-Streamlit Community Cloud defaults to 3.12, so when deploying the dashboard set
-the Python version to 3.14 under Advanced settings. A version mismatch between
-local, CI, and the dashboard host is a reproducibility hazard.
-
 Copy `.env.example` to `.env` and fill in your Alpaca paper keys, generated at
 app.alpaca.markets under Paper Trading → API Keys. `.env` is gitignored and must
 never be committed. In CI the same two values come from GitHub Secrets.
