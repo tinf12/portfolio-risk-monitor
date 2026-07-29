@@ -57,15 +57,28 @@ risk figures.
 
 ## Dashboard
 
-<!-- HUMAN-AUTHORED. Do not fill in automatically.
-     Deployed link, plus one screenshot.
-     Note on the screenshot: the live panels currently read "not yet computed"
-     for anything needing 30 sessions of history, which is honest but reads as
-     unfinished. Either wait until roughly mid-September, or screenshot a
-     replay-populated view and caption it explicitly as generated data. An
-     uncaptioned fixture screenshot would present invented rows as real. -->
+**[tinf12-portfolio-risk-monitor.streamlit.app](https://tinf12-portfolio-risk-monitor.streamlit.app/)**
 
-*To be added.*
+Live trading began 2026-07-28, so the risk panels currently state that their
+estimates do not yet exist rather than showing a figure computed from too little
+history. Volatility appears after 20 sessions, the 30-day VaR after 30, and the
+250-day window not until 2027.
+
+<!-- HUMAN-AUTHORED. Do not fill in automatically.
+     Screenshot still to add. The live panels read "not yet computed" for
+     anything needing 30 sessions, which is honest but reads as unfinished, so
+     mid-September is the earliest a screenshot sells the project. A
+     replay-populated view would work sooner but must be captioned explicitly
+     as generated data — an uncaptioned fixture screenshot would present
+     invented rows as real. -->
+
+<!-- Note: the free tier sleeps after 12 hours without traffic, and a cold start
+     shows a bare Streamlit wrapper for around 30 seconds before the app loads.
+     Worth knowing before sending the link to anyone. -->
+
+The app opens the database read-only at the SQLite level and imports nothing
+from `src.risk`, so it cannot compute or alter a figure. It holds no
+credentials: the daily job writes the database, and the dashboard only reads it.
 
 ---
 

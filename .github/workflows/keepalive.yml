@@ -1,0 +1,74 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows on repositories with no recent activity
+# (60 days), and a successful scheduled run does not itself count as activity.
+# The daily job normally supplies that activity by committing data/risk.db --
+# but only while it is succeeding. A run that fails every day for two months,
+# or a long market closure, leaves no pushes behind and the schedule is quietly
+# switched off. Nothing in the YAML looks wrong afterwards, and the daily job
+# simply stops.
+#
+# This workflow exists to make that impossible. It touches a file and pushes on
+# the 1st of each month, so the repository always has activity inside any 60-day
+# window regardless of whether the daily job is healthy.
+#
+# It deliberately does not touch data/risk.db. CI's daily job is the only writer
+# that commits that file, and a keepalive writing to it would create exactly the
+# binary conflict the daily job's rebase loop exists to avoid.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month. Away from the daily job's 11:00 slot
+    # so the two never race for a push.
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record heartbeat
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # A plain text file, rewritten each month. Human-readable so anyone
+          # reading the repo can see what it is and why it changes.
+          cat > .github/keepalive.txt <<EOF
+          Scheduled workflows are disabled after 60 days without repository
+          activity, and a successful scheduled run does not count as activity.
+          This file is rewritten monthly so that never happens.
+
+          Last touched: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          EOF
+
+          if git diff --quiet -- .github/keepalive.txt; then
+            echo "No change to commit; the file already carries today's stamp."
+            exit 0
+          fi
+
+          git add .github/keepalive.txt
+          git commit -m "chore: monthly keepalive $(date -u +%Y-%m-%d)"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && \
+               git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; retrying."
+            sleep 5
+          done
+          echo "Could not push after 3 attempts." >&2
+          exit 1
