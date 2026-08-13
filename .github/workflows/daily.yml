@@ -80,8 +80,20 @@ jobs:
       # Runs even when the job above fails, so the failure heartbeat reaches
       # the repo. Without it a failed run is invisible: GitHub sends no
       # notification for a failed scheduled workflow.
+      #
+      # Restricted to main. The job writes data/risk.db on every run, including
+      # a workflow_dispatch against a feature branch -- and a feature branch
+      # carries whatever copy of the database it was cut from. Committing there
+      # writes a snapshot derived from stale inputs onto a branch that will
+      # later be merged, which is how a fortnight of sessions gets silently
+      # reverted. This has happened once already.
+      #
+      # CLAUDE.md says CI is the only writer that commits; this makes the
+      # unstated other half of that rule explicit, which is that it commits on
+      # one branch only. Dispatching against a branch remains useful for
+      # testing the job itself -- it simply leaves no rows behind.
       - name: Commit database
-        if: always()
+        if: always() && github.ref_name == 'main'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
