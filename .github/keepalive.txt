@@ -2,4 +2,4 @@ Scheduled workflows are disabled after 60 days without repository
 activity, and a successful scheduled run does not count as activity.
 This file is rewritten monthly so that never happens.
 
-Last touched: 2026-08-01 08:10:47 UTC
+Last touched: 2026-09-01 10:56:19 UTC
