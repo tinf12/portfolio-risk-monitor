@@ -110,6 +110,18 @@ ADDITIVITY_TOLERANCE = 1e-6
 # larger than drift can explain.
 DRIFT_ALERT_THRESHOLD = 0.25
 
+# Alpaca rounds account equity and each position's market value to cents
+# independently, so the parts do not re-sum to the whole. Measured across the
+# stored history the raw weights miss 1.0 by 2e-8 to 7e-6 -- comfortably outside
+# the 1e-9 that historical_contribution() requires, which is what stalled the
+# daily job from 2026-09-10.
+#
+# This bounds how much of that miss is treated as rounding. Above it, the parts
+# genuinely are not the whole: a position is missing from the snapshot, or
+# total_value is measuring something else. On a $100k account this is $10, which
+# no rounding produces and no position is smaller than.
+WEIGHT_ROUNDING_TOLERANCE = 1e-4
+
 
 def _write_risk_estimates(
     conn: sqlite3.Connection,
@@ -199,16 +211,19 @@ def _write_risk_contributions(
     """Decompose each stored historical VaR figure across the positions held.
 
     Weights come from the account snapshot, with cash as a zero-return position
-    so they sum to 1.0 (see CASH_SYMBOL). Per-symbol returns come from stored
-    closes, so this decomposes the price-only relationship between positions and
-    the portfolio.
+    so they sum to 1.0 (see CASH_SYMBOL), then rescaled by their own sum to
+    absorb the broker's cent rounding (see WEIGHT_ROUNDING_TOLERANCE).
+    Per-symbol returns come from stored closes, so this decomposes the
+    price-only relationship between positions and the portfolio.
 
     Only windows and confidence levels that already have a stored historical
     estimate are decomposed: a contribution row exists to explain a specific
     var_amount, so writing one with nothing to join to would be meaningless.
 
     Raises:
-        RuntimeError: If the contributions miss the stored var_amount by more
+        RuntimeError: If the position market values and cash miss total_value by
+            more than WEIGHT_ROUNDING_TOLERANCE, which is more than rounding can
+            explain. Or if the contributions miss the stored var_amount by more
             than RESIDUAL_TOLERANCE. Small residuals are cash drag and
             dividends; a large one means the decomposition is not describing
             the portfolio the estimate was computed from.
@@ -217,11 +232,30 @@ def _write_risk_contributions(
         logger.info("No positions on %s; nothing to decompose.", session)
         return 0
 
-    weights = {
+    raw_weights = {
         symbol: market_value / snapshot.total_value
         for symbol, _qty, market_value in snapshot.positions
     }
-    weights[CASH_SYMBOL] = snapshot.cash / snapshot.total_value
+    raw_weights[CASH_SYMBOL] = snapshot.cash / snapshot.total_value
+
+    # Rescale away the cent-rounding gap (see WEIGHT_ROUNDING_TOLERANCE) so the
+    # weights sum to 1.0 by construction rather than by luck.
+    #
+    # This is not the sleeve normalisation CASH_SYMBOL warns against. That one
+    # drops cash and inflates the equity weights to fill the hole, decomposing a
+    # fully-invested portfolio that is not the one being held. This divides every
+    # weight by the same factor, cash included, so the proportions between them
+    # are untouched and the cash sleeve keeps its full size. It corrects
+    # rounding; it does not reallocate.
+    weight_sum = sum(raw_weights.values())
+    if abs(weight_sum - 1.0) > WEIGHT_ROUNDING_TOLERANCE:
+        raise RuntimeError(
+            f"Position market values and cash for {session} sum to "
+            f"{weight_sum:.9f} of total_value, not 1.0. That is too far off to "
+            f"be cent rounding: a position is missing from the snapshot, or "
+            f"total_value is not the total of these parts."
+        )
+    weights = {symbol: weight / weight_sum for symbol, weight in raw_weights.items()}
 
     rows: list[tuple[str, str, float, float | None, float, str, float, int]] = []
 
