@@ -33,6 +33,8 @@ from src.data.calendar import (
     is_first_trading_day_of_month,
     most_recent_completed_session,
     next_trading_day,
+    previous_trading_day,
+    trading_days_between,
 )
 from src.db.connection import get_connection
 from src.db.upserts import (
@@ -452,10 +454,42 @@ def run_daily(
             if is_current:
                 upsert_positions(conn, snapshot.position_rows(session))
 
-                previous_value = get_previous_total_value(conn, session)
-                if previous_value is not None and previous_value > 0:
-                    daily_pnl = snapshot.total_value - previous_value
-                    daily_return = daily_pnl / previous_value
+                # daily_pnl is only daily if the row behind it is the previous
+                # session. After a missed run the nearest stored row is several
+                # sessions back, and differencing against it produces a
+                # multi-day move -- which would then enter the VaR window as a
+                # single day's return and be breach-tested as one, making the
+                # model look badly calibrated for a gap in the data rather than
+                # anything about the portfolio.
+                #
+                # The gap is left as NULL rather than filled. The missing
+                # sessions are not recoverable: Alpaca cannot report what the
+                # account held on a past date (see fetch_account_snapshot), so
+                # there is no honest value to put here. A NULL is a stated
+                # absence; a multi-day return in a daily column is a wrong
+                # number that nothing downstream can detect.
+                previous = get_previous_total_value(conn, session)
+                expected_previous = previous_trading_day(session)
+
+                if previous is None:
+                    daily_pnl = None
+                    daily_return = None
+                elif previous[0] != expected_previous:
+                    missed = trading_days_between(previous[0], session)[1:-1]
+                    logger.warning(
+                        "Gap in portfolio_pnl before %s: nearest stored row is "
+                        "%s, but the previous session is %s (%d session(s) "
+                        "missing: %s). Storing total_value with daily_pnl and "
+                        "daily_return NULL rather than a %d-session move "
+                        "labelled as one day.",
+                        session, previous[0], expected_previous, len(missed),
+                        ", ".join(missed), len(missed) + 1,
+                    )
+                    daily_pnl = None
+                    daily_return = None
+                elif previous[1] > 0:
+                    daily_pnl = snapshot.total_value - previous[1]
+                    daily_return = daily_pnl / previous[1]
                 else:
                     daily_pnl = None
                     daily_return = None

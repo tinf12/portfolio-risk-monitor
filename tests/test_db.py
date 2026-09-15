@@ -215,7 +215,7 @@ class TestPreviousTotalValue:
     def test_returns_most_recent_earlier_day(self, conn: sqlite3.Connection) -> None:
         upsert_portfolio_pnl(conn, "2024-01-02", 100_000.0, 0.0, None, None)
         upsert_portfolio_pnl(conn, "2024-01-03", 100_500.0, 0.0, 500.0, 0.005)
-        assert get_previous_total_value(conn, "2024-01-04") == 100_500.0
+        assert get_previous_total_value(conn, "2024-01-04") == ("2024-01-03", 100_500.0)
 
     def test_none_when_no_history(self, conn: sqlite3.Connection) -> None:
         assert get_previous_total_value(conn, "2024-01-02") is None
@@ -228,6 +228,7 @@ class TestPreviousTotalValue:
 
     def test_spans_a_gap_in_history(self, conn: sqlite3.Connection) -> None:
         """A missed run leaves a gap; the lookup must still find the last
-        stored value rather than assuming a one-day step."""
+        stored value rather than assuming a one-day step. The date comes back
+        with it so the caller can tell that is what happened."""
         upsert_portfolio_pnl(conn, "2024-01-02", 100_000.0, 0.0, None, None)
-        assert get_previous_total_value(conn, "2024-01-10") == 100_000.0
+        assert get_previous_total_value(conn, "2024-01-10") == ("2024-01-02", 100_000.0)

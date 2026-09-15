@@ -469,17 +469,20 @@ def record_run(
 def get_previous_total_value(
     conn: sqlite3.Connection,
     trade_date: str,
-) -> float | None:
-    """Return total_value for the most recent stored date strictly before
-    trade_date, or None if there is no earlier row.
+) -> tuple[str, float] | None:
+    """Return (trade_date, total_value) for the most recent stored date strictly
+    before trade_date, or None if there is no earlier row.
 
     Uses the stored series rather than an assumed calendar step, so a gap in
     history (a missed run, a backfill boundary) is visible to the caller
-    instead of being silently papered over.
+    instead of being silently papered over. The date is returned with the value
+    precisely so the caller can see that gap: differencing against a row several
+    sessions back yields a multi-day move, and storing it as daily_return would
+    put an observation in the VaR window that no single day produced.
     """
     row = conn.execute(
         """
-        SELECT total_value
+        SELECT trade_date, total_value
         FROM portfolio_pnl
         WHERE trade_date < ?
         ORDER BY trade_date DESC
@@ -487,7 +490,7 @@ def get_previous_total_value(
         """,
         (trade_date,),
     ).fetchone()
-    return float(row["total_value"]) if row is not None else None
+    return (row["trade_date"], float(row["total_value"])) if row is not None else None
 
 
 def latest_successful_run(conn: sqlite3.Connection) -> str | None:
