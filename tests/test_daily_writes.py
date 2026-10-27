@@ -125,6 +125,84 @@ class TestBackdatedRunsDoNotFabricateHistory:
         assert _counts(job_db)["portfolio_pnl"] == 1
 
 
+class TestGapsDoNotBecomeDailyReturns:
+    """A missed run leaves portfolio_pnl with no row for the previous session.
+    Differencing against the nearest earlier row would store a multi-day move in
+    a column the VaR window reads as one day's return.
+
+    This was a real outage: the job failed from 2026-09-10 to 2026-09-15, and
+    the next successful run would have written a five-session move as the
+    daily return for 2026-09-15.
+    """
+
+    def _seed_pnl(self, db: Path, trade_date: str, total_value: float) -> None:
+        from src.db.connection import get_connection
+        from src.db.schema import create_schema
+        from src.db.upserts import upsert_portfolio_pnl
+
+        with get_connection(db) as conn:
+            create_schema(conn)
+            upsert_portfolio_pnl(conn, trade_date, total_value, 0.0, None, None)
+            conn.commit()
+
+    def _run(self, db: Path) -> tuple[float | None, float | None]:
+        from src.jobs.daily import run_daily
+
+        with (
+            patch("src.jobs.daily.fetch_daily_closes", return_value=PRICES),
+            patch("src.jobs.daily.fetch_account_snapshot", return_value=SNAPSHOT),
+            patch("src.jobs.daily.most_recent_completed_session", return_value=SESSION),
+            patch("src.jobs.daily.submit_orders"),
+        ):
+            run_daily(SESSION)
+
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT daily_pnl, daily_return FROM portfolio_pnl "
+                "WHERE trade_date = ?",
+                (SESSION,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_gap_leaves_pnl_null(self, job_db: Path) -> None:
+        """2026-07-16 is five sessions before 2026-07-24, not one."""
+        self._seed_pnl(job_db, "2026-07-16", 90_000.0)
+
+        daily_pnl, daily_return = self._run(job_db)
+
+        assert daily_pnl is None
+        assert daily_return is None
+
+    def test_contiguous_session_still_computes(self, job_db: Path) -> None:
+        """Control: when the previous session is present, nothing changes."""
+        self._seed_pnl(job_db, "2026-07-23", 90_000.0)
+
+        daily_pnl, daily_return = self._run(job_db)
+
+        assert daily_pnl == pytest.approx(10_000.0)
+        assert daily_return == pytest.approx(10_000.0 / 90_000.0)
+
+    def test_total_value_is_still_stored_across_a_gap(self, job_db: Path) -> None:
+        """The gap suppresses the return, not the row. Dropping the row would
+        start a second gap on the next session."""
+        self._seed_pnl(job_db, "2026-07-16", 90_000.0)
+        self._run(job_db)
+
+        conn = sqlite3.connect(job_db)
+        try:
+            stored = conn.execute(
+                "SELECT total_value FROM portfolio_pnl WHERE trade_date = ?",
+                (SESSION,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert stored is not None
+        assert stored[0] == pytest.approx(100_000.0)
+
+
 class TestWhenOrdersAreSubmitted:
     """The one code path that spends money.
 

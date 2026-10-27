@@ -33,6 +33,8 @@ from src.data.calendar import (
     is_first_trading_day_of_month,
     most_recent_completed_session,
     next_trading_day,
+    previous_trading_day,
+    trading_days_between,
 )
 from src.db.connection import get_connection
 from src.db.upserts import (
@@ -109,6 +111,18 @@ ADDITIVITY_TOLERANCE = 1e-6
 # it slightly fictional. It only becomes evidence of a fault when it is far
 # larger than drift can explain.
 DRIFT_ALERT_THRESHOLD = 0.25
+
+# Alpaca rounds account equity and each position's market value to cents
+# independently, so the parts do not re-sum to the whole. Measured across the
+# stored history the raw weights miss 1.0 by 2e-8 to 7e-6 -- comfortably outside
+# the 1e-9 that historical_contribution() requires, which is what stalled the
+# daily job from 2026-09-10.
+#
+# This bounds how much of that miss is treated as rounding. Above it, the parts
+# genuinely are not the whole: a position is missing from the snapshot, or
+# total_value is measuring something else. On a $100k account this is $10, which
+# no rounding produces and no position is smaller than.
+WEIGHT_ROUNDING_TOLERANCE = 1e-4
 
 
 def _write_risk_estimates(
@@ -199,16 +213,19 @@ def _write_risk_contributions(
     """Decompose each stored historical VaR figure across the positions held.
 
     Weights come from the account snapshot, with cash as a zero-return position
-    so they sum to 1.0 (see CASH_SYMBOL). Per-symbol returns come from stored
-    closes, so this decomposes the price-only relationship between positions and
-    the portfolio.
+    so they sum to 1.0 (see CASH_SYMBOL), then rescaled by their own sum to
+    absorb the broker's cent rounding (see WEIGHT_ROUNDING_TOLERANCE).
+    Per-symbol returns come from stored closes, so this decomposes the
+    price-only relationship between positions and the portfolio.
 
     Only windows and confidence levels that already have a stored historical
     estimate are decomposed: a contribution row exists to explain a specific
     var_amount, so writing one with nothing to join to would be meaningless.
 
     Raises:
-        RuntimeError: If the contributions miss the stored var_amount by more
+        RuntimeError: If the position market values and cash miss total_value by
+            more than WEIGHT_ROUNDING_TOLERANCE, which is more than rounding can
+            explain. Or if the contributions miss the stored var_amount by more
             than RESIDUAL_TOLERANCE. Small residuals are cash drag and
             dividends; a large one means the decomposition is not describing
             the portfolio the estimate was computed from.
@@ -217,11 +234,30 @@ def _write_risk_contributions(
         logger.info("No positions on %s; nothing to decompose.", session)
         return 0
 
-    weights = {
+    raw_weights = {
         symbol: market_value / snapshot.total_value
         for symbol, _qty, market_value in snapshot.positions
     }
-    weights[CASH_SYMBOL] = snapshot.cash / snapshot.total_value
+    raw_weights[CASH_SYMBOL] = snapshot.cash / snapshot.total_value
+
+    # Rescale away the cent-rounding gap (see WEIGHT_ROUNDING_TOLERANCE) so the
+    # weights sum to 1.0 by construction rather than by luck.
+    #
+    # This is not the sleeve normalisation CASH_SYMBOL warns against. That one
+    # drops cash and inflates the equity weights to fill the hole, decomposing a
+    # fully-invested portfolio that is not the one being held. This divides every
+    # weight by the same factor, cash included, so the proportions between them
+    # are untouched and the cash sleeve keeps its full size. It corrects
+    # rounding; it does not reallocate.
+    weight_sum = sum(raw_weights.values())
+    if abs(weight_sum - 1.0) > WEIGHT_ROUNDING_TOLERANCE:
+        raise RuntimeError(
+            f"Position market values and cash for {session} sum to "
+            f"{weight_sum:.9f} of total_value, not 1.0. That is too far off to "
+            f"be cent rounding: a position is missing from the snapshot, or "
+            f"total_value is not the total of these parts."
+        )
+    weights = {symbol: weight / weight_sum for symbol, weight in raw_weights.items()}
 
     rows: list[tuple[str, str, float, float | None, float, str, float, int]] = []
 
@@ -418,10 +454,42 @@ def run_daily(
             if is_current:
                 upsert_positions(conn, snapshot.position_rows(session))
 
-                previous_value = get_previous_total_value(conn, session)
-                if previous_value is not None and previous_value > 0:
-                    daily_pnl = snapshot.total_value - previous_value
-                    daily_return = daily_pnl / previous_value
+                # daily_pnl is only daily if the row behind it is the previous
+                # session. After a missed run the nearest stored row is several
+                # sessions back, and differencing against it produces a
+                # multi-day move -- which would then enter the VaR window as a
+                # single day's return and be breach-tested as one, making the
+                # model look badly calibrated for a gap in the data rather than
+                # anything about the portfolio.
+                #
+                # The gap is left as NULL rather than filled. The missing
+                # sessions are not recoverable: Alpaca cannot report what the
+                # account held on a past date (see fetch_account_snapshot), so
+                # there is no honest value to put here. A NULL is a stated
+                # absence; a multi-day return in a daily column is a wrong
+                # number that nothing downstream can detect.
+                previous = get_previous_total_value(conn, session)
+                expected_previous = previous_trading_day(session)
+
+                if previous is None:
+                    daily_pnl = None
+                    daily_return = None
+                elif previous[0] != expected_previous:
+                    missed = trading_days_between(previous[0], session)[1:-1]
+                    logger.warning(
+                        "Gap in portfolio_pnl before %s: nearest stored row is "
+                        "%s, but the previous session is %s (%d session(s) "
+                        "missing: %s). Storing total_value with daily_pnl and "
+                        "daily_return NULL rather than a %d-session move "
+                        "labelled as one day.",
+                        session, previous[0], expected_previous, len(missed),
+                        ", ".join(missed), len(missed) + 1,
+                    )
+                    daily_pnl = None
+                    daily_return = None
+                elif previous[1] > 0:
+                    daily_pnl = snapshot.total_value - previous[1]
+                    daily_return = daily_pnl / previous[1]
                 else:
                     daily_pnl = None
                     daily_return = None
